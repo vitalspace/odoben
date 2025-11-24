@@ -80,6 +80,5 @@ bun test
 - **Blockchain:** [Sui](https://sui.io/), [Walrus Protocol](https://www.walrus.xyz/)
 - **Database:** MongoDB (via Mongoose)
 
-## 📄 Documentation
-
-For more detailed documentation on each component, please refer to the `README.md` files located in their respective directories.
+## 📄 Documentation 
+https://odoben.xyz/docs
