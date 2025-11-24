@@ -37,8 +37,7 @@
 					Start Uploading
 				</a>
 				<a 
-					href="https://docs.walrus.site" 
-					target="_blank"
+					href="https://odoben.xyz/docs" 
 					class="px-8 py-4 bg-white/5 hover:bg-white/10 border border-white/10 backdrop-blur-md rounded-full font-bold text-lg transition-all hover:-translate-y-1"
 				>
 					Read Docs
