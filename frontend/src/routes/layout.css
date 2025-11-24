@@ -1,0 +1,12 @@
+@import 'tailwindcss';
+@plugin '@tailwindcss/forms';
+@plugin '@tailwindcss/typography';
+
+@theme {
+	--color-odoben-bg: #0f2c3e;
+	--color-odoben-surface: #1e3a4c;
+	--color-odoben-primary: #e8dcc5;
+	--color-odoben-accent: #816558;
+	--color-odoben-text: #f0f4f8;
+	--color-odoben-aqua: #7d9c9f;
+}

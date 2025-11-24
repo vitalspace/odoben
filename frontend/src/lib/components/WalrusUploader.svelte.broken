@@ -1,0 +1,492 @@
+<script lang="ts">
+	import { onMount } from 'svelte';
+	import { walletStore } from '$lib/services/walletService';
+	import { apiServices } from '$lib/services/apiServices';
+	import { fade, slide } from 'svelte/transition';
+
+	const PUBLISHER = 'https://publisher.walrus-testnet.walrus.space';
+	const AGGREGATOR = 'https://aggregator.walrus-testnet.walrus.space';
+	const MAX_FILE_SIZE = 10 * 1024 * 1024;
+
+	let activeTab = $state('upload'); // 'upload' | 'view'
+	let selectedFile: File | null = $state(null);
+	let compressedBlob: Blob | null = $state(null);
+	let compressionEnabled = $state(true);
+	let compressionQuality = $state(70);
+	let maxWidth = $state(1920);
+	let isDragging = $state(false);
+	let isLoading = $state(false);
+	let loadingText = $state('');
+	let uploadResult: { blobId: string; url: string } | null = $state(null);
+	let previewUrl: string | null = $state(null);
+	let fileInfo: { type: string; format: string; size: string } | null = $state(null);
+	
+	// View tab state
+	let viewBlobId = $state('');
+	let viewLoading = $state(false);
+	let viewContent: { type: 'image' | 'other'; url: string; name: string; info: any } | null = $state(null);
+	let viewError = $state('');
+
+	// Stats for compression
+	let originalSize = $state(0);
+	let compressedSize = $state(0);
+
+	function formatFileSize(bytes: number) {
+		if (bytes === 0) return '0 Bytes';
+		const k = 1024;
+		const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+		const i = Math.floor(Math.log(bytes) / Math.log(k));
+		return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+	}
+
+	function detectFileType(arrayBuffer: ArrayBuffer): string {
+		const bytes = new Uint8Array(arrayBuffer);
+		
+		if (bytes.length >= 3 && bytes[0] === 0xFF && bytes[1] === 0xD8 && bytes[2] === 0xFF) return 'image/jpeg';
+		if (bytes.length >= 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4E && bytes[3] === 0x47) return 'image/png';
+		if (bytes.length >= 6 && bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46) return 'image/gif';
+		if (bytes.length >= 12 && bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50) return 'image/webp';
+		if (bytes.length >= 5 && bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46) return 'application/pdf';
+		
+		return 'application/octet-stream';
+	}
+
+	async function compressImage(file: File, quality: number, maxWidth: number): Promise<Blob> {
+		return new Promise((resolve, reject) => {
+			const reader = new FileReader();
+			reader.onload = (e) => {
+				const img = new Image();
+				img.onload = () => {
+					const canvas = document.createElement('canvas');
+					let width = img.width;
+					let height = img.height;
+
+					if (width > maxWidth) {
+						height = (height * maxWidth) / width;
+						width = maxWidth;
+					}
+
+					canvas.width = width;
+					canvas.height = height;
+
+					const ctx = canvas.getContext('2d');
+					if (!ctx) {
+						reject(new Error('Could not get canvas context'));
+						return;
+					}
+					ctx.drawImage(img, 0, 0, width, height);
+
+					canvas.toBlob(
+						(blob) => {
+							if (blob) resolve(blob);
+							else reject(new Error('Compression failed'));
+						},
+						'image/jpeg',
+						quality / 100
+					);
+				};
+				img.onerror = () => reject(new Error('Error loading image'));
+				if (e.target?.result) img.src = e.target.result as string;
+			};
+			reader.onerror = () => reject(new Error('Error reading file'));
+			reader.readAsDataURL(file);
+		});
+	}
+
+	async function handleFileSelect(file: File) {
+		if (file.size > MAX_FILE_SIZE) {
+			alert('File too large. Max 10 MiB.');
+			return;
+		}
+
+		selectedFile = file;
+		originalSize = file.size;
+		compressedBlob = null;
+		uploadResult = null;
+		previewUrl = null;
+
+		const isImage = file.type.startsWith('image/');
+
+		if (isImage && compressionEnabled) {
+			try {
+				isLoading = true;
+				loadingText = 'Compressing image...';
+				
+				const compressed = await compressImage(file, compressionQuality, maxWidth);
+				
+				if (compressed.size < file.size) {
+					compressedBlob = compressed;
+					compressedSize = compressed.size;
+				} else {
+					compressedBlob = null;
+					compressedSize = file.size;
+				}
+			} catch (error) {
+				console.error('Compression error:', error);
+			} finally {
+				isLoading = false;
+			}
+		} else {
+			compressedSize = file.size;
+		}
+	}
+
+	function onDrop(e: DragEvent) {
+		e.preventDefault();
+		isDragging = false;
+		if (e.dataTransfer?.files.length) {
+			handleFileSelect(e.dataTransfer.files[0]);
+		}
+	}
+
+	async function uploadToWalrus() {
+		if (!selectedFile) return;
+		
+		// TODO: Check if wallet is connected if we want to associate upload with user
+		// if (!$walletStore.isConnected) {
+		// 	alert('Please connect your wallet first');
+		// 	return;
+		// }
+
+		const fileToUpload = compressedBlob || selectedFile;
+		
+		isLoading = true;
+		loadingText = 'Uploading to Walrus...';
+		uploadResult = null;
+
+		try {
+			const arrayBuffer = await fileToUpload.arrayBuffer();
+			
+			const response = await fetch(`${PUBLISHER}/v1/blobs?epochs=5`, {
+				method: 'PUT',
+				body: arrayBuffer,
+			});
+
+			if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+
+			const data = await response.json();
+			let blobId = '';
+
+			if (data.newlyCreated) {
+				blobId = data.newlyCreated.blobObject.blobId;
+			} else if (data.alreadyCertified) {
+				blobId = data.alreadyCertified.blobId;
+			} else {
+				throw new Error('Unexpected response from Walrus');
+			}
+
+			const url = `${AGGREGATOR}/v1/blobs/${blobId}`;
+			uploadResult = { blobId, url };
+
+			// Save metadata to backend
+			if ($walletStore.isConnected && $walletStore.address) {
+				try {
+					await apiServices.saveUpload({
+						blobId,
+						owner: $walletStore.address,
+						filename: selectedFile.name,
+						mimeType: fileToUpload.type,
+						size: fileToUpload.size
+					});
+					console.log('Metadata saved to backend');
+				} catch (err) {
+					console.error('Failed to save metadata:', err);
+					// Don't fail the whole process if backend save fails, but maybe warn user
+				}
+			}
+
+			loadingText = 'Waiting for certification...';
+			// Simple delay to allow propagation (in a real app, might poll)
+			await new Promise(resolve => setTimeout(resolve, 2000));
+
+			// Show preview
+			previewUrl = URL.createObjectURL(fileToUpload);
+
+		} catch (error) {
+			console.error('Upload error:', error);
+			alert('Upload failed: ' + (error as Error).message);
+		} finally {
+			isLoading = false;
+		}
+	}
+
+	async function viewFile() {
+		if (!viewBlobId.trim()) return;
+
+		viewLoading = true;
+		viewError = '';
+		viewContent = null;
+
+		try {
+			const response = await fetch(`${AGGREGATOR}/v1/blobs/${viewBlobId}`);
+			if (!response.ok) throw new Error('File not found or unavailable');
+
+			const arrayBuffer = await response.arrayBuffer();
+			const type = detectFileType(arrayBuffer);
+			const blob = new Blob([arrayBuffer], { type });
+			const url = URL.createObjectURL(blob);
+
+			viewContent = {
+				type: type.startsWith('image/') ? 'image' : 'other',
+				url,
+				name: 'downloaded_file', // We don't know the name from just blobID unless we query our backend
+				info: {
+					type: type.split('/')[0],
+					format: type.split('/')[1] || 'unknown',
+					size: formatFileSize(blob.size)
+				}
+			};
+
+		} catch (error) {
+			viewError = (error as Error).message;
+		} finally {
+			viewLoading = false;
+		}
+	}
+
+	function copyToClipboard(text: string) {
+		navigator.clipboard.writeText(text);
+		// Could add a toast notification here
+	}
+
+	function clearAll() {
+		selectedFile = null;
+		compressedBlob = null;
+		uploadResult = null;
+		previewUrl = null;
+	}
+</script>
+
+<div class="w-full max-w-4xl mx-auto bg-white/5 backdrop-blur-xl border border-white/10 rounded-3xl shadow-2xl shadow-purple-900/20 overflow-hidden">
+	<!-- Header -->
+	<div class="bg-gradient-to-r from-purple-600/30 to-pink-600/30 backdrop-blur-md p-8 text-white text-center relative border-b border-white/10">
+		<h1 class="text-4xl font-bold mb-2">🐋 Odoben</h1>
+		<p class="text-gray-200">Decentralized storage on Sui</p>
+	</div>
+
+	<!-- Tabs -->
+	<div class="flex border-b border-white/10">
+		<button 
+			class="flex-1 py-4 text-center font-semibold transition-all {activeTab === 'upload' ? 'text-purple-400 border-b-2 border-purple-500' : 'text-gray-400 hover:text-white hover:bg-white/5'}"
+			onclick={() => activeTab = 'upload'}
+		>
+			📤 Upload File
+		</button>
+		<button 
+			class="flex-1 py-4 text-center font-semibold transition-all {activeTab === 'view' ? 'text-purple-400 border-b-2 border-purple-500' : 'text-gray-400 hover:text-white hover:bg-white/5'}"
+			onclick={() => activeTab = 'view'}
+		>
+			👁️ View File
+		</button>
+	</div>
+
+	<div class="p-8">
+		{#if activeTab === 'upload'}
+					{#if selectedFile.type.startsWith('image/')}
+						<div class="bg-white/5 backdrop-blur-md border border-white/10 p-6 rounded-2xl mb-6" transition:slide>
+							<div class="flex items-center gap-3 mb-4">
+								<input type="checkbox" id="enableCompression" bind:checked={compressionEnabled} class="w-5 h-5 text-purple-500 rounded focus:ring-purple-500 bg-white/10 border-white/20" onchange={() => handleFileSelect(selectedFile!)} />
+								<label for="enableCompression" class="font-semibold text-white">🗜️ Compress image before upload</label>
+							</div>
+
+							{#if compressionEnabled}
+								<div class="space-y-4">
+									<div>
+										<div class="flex justify-between mb-2">
+											<span class="font-medium text-gray-300">Quality</span>
+											<span class="text-purple-400 font-mono">{compressionQuality}%</span>
+										</div>
+										<input 
+											type="range" 
+											min="30" 
+											max="95" 
+											bind:value={compressionQuality} 
+											onchange={() => handleFileSelect(selectedFile!)}
+											class="w-full h-2 bg-white/10 rounded-lg appearance-none cursor-pointer accent-purple-500"
+										/>
+									</div>
+
+									<div>
+										<div class="flex justify-between mb-2">
+											<span class="font-medium text-gray-300">Max Width (px)</span>
+											<span class="text-purple-400 font-mono">{maxWidth}</span>
+										</div>
+										<input 
+											type="range" 
+											min="640" 
+											max="3840" 
+											step="160" 
+											bind:value={maxWidth} 
+											onchange={() => handleFileSelect(selectedFile!)}
+											class="w-full h-2 bg-white/10 rounded-lg appearance-none cursor-pointer accent-purple-500"
+										/>
+									</div>
+
+									<div class="grid grid-cols-2 gap-4 mt-4">
+										<div class="bg-white/5 p-4 rounded-xl text-center border-l-4 border-red-500/50 backdrop-blur-sm">
+											<div class="text-xs text-gray-400 uppercase mb-1">Original</div>
+											<div class="text-xl font-bold text-white">{formatFileSize(originalSize)}</div>
+										</div>
+										<div class="bg-white/5 p-4 rounded-xl text-center border-l-4 border-green-500/50 backdrop-blur-sm">
+											<div class="text-xs text-gray-400 uppercase mb-1">To Upload</div>
+											<div class="text-xl font-bold text-white">{formatFileSize(compressedSize)}</div>
+										</div>
+									</div>
+
+									{#if compressedSize < originalSize}
+										<div class="bg-green-500/10 border border-green-500/30 text-green-400 p-3 rounded-xl text-center text-sm font-medium backdrop-blur-sm">
+											✅ Reduction: {((originalSize - compressedSize) / originalSize * 100).toFixed(1)}% saved
+										</div>
+									{:else}
+										<div class="bg-yellow-500/10 border border-yellow-500/30 text-yellow-400 p-3 rounded-xl text-center text-sm font-medium backdrop-blur-sm">
+											ℹ️ Image already optimized. Uploading original.
+										</div>
+									{/if}
+								</div>
+							{/if}
+						</div>
+					{/if}
+
+					<!-- Actions -->
+					<div class="flex gap-4 mb-8">
+						<button 
+							class="flex-1 bg-gradient-to-r from-purple-600 to-pink-600 text-white py-3 px-6 rounded-xl font-semibold shadow-lg shadow-purple-900/30 hover:shadow-xl hover:shadow-purple-900/50 transform hover:-translate-y-0.5 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+							onclick={uploadToWalrus}
+							disabled={isLoading}
+						>
+							{#if isLoading}
+								<span class="inline-block animate-spin mr-2">⏳</span>
+							{/if}
+							{isLoading ? 'Processing...' : '📤 Upload to Walrus'}
+						</button>
+						<button 
+							class="px-6 py-3 bg-white/10 text-gray-300 rounded-xl font-semibold hover:bg-white/20 transition-colors border border-white/10"
+							onclick={clearAll}
+							disabled={isLoading}
+						>
+							🗑️ Clear
+						</button>
+					</div>
+				{/if}
+
+				{#if isLoading}
+					<div class="text-center py-8">
+						<div class="w-12 h-12 border-4 border-white/10 border-t-purple-500 rounded-full animate-spin mx-auto mb-4"></div>
+						<p class="text-gray-300 font-medium">{loadingText}</p>
+					</div>
+				{/if}
+
+				{#if uploadResult}
+					<div class="bg-green-500/10 border-2 border-green-500/30 rounded-2xl p-6 mb-8 backdrop-blur-sm" transition:slide>
+						<h3 class="text-green-400 font-bold text-lg mb-4">✅ File Uploaded Successfully!</h3>
+						
+						<div class="space-y-3">
+							<div class="bg-white/5 p-3 rounded-xl backdrop-blur-sm border border-white/10">
+								<div class="text-xs text-gray-400 uppercase font-semibold mb-1">Blob ID</div>
+								<div class="flex justify-between items-center gap-2">
+									<code class="text-sm text-gray-200 break-all">{uploadResult.blobId}</code>
+									<button class="text-purple-400 hover:text-purple-300 text-sm font-medium" onclick={() => copyToClipboard(uploadResult!.blobId)}>Copy</button>
+								</div>
+							</div>
+							
+							<div class="bg-white/5 p-3 rounded-xl backdrop-blur-sm border border-white/10">
+								<div class="text-xs text-gray-400 uppercase font-semibold mb-1">Access URL</div>
+								<div class="flex justify-between items-center gap-2">
+									<code class="text-sm text-gray-200 break-all truncate">{uploadResult.url}</code>
+									<button class="text-purple-400 hover:text-purple-300 text-sm font-medium" onclick={() => copyToClipboard(uploadResult!.url)}>Copy</button>
+								</div>
+							</div>
+						</div>
+					</div>
+				{/if}
+
+				{#if previewUrl}
+					<div class="bg-gray-50 rounded-xl p-6" transition:slide>
+						<h3 class="text-gray-800 font-bold text-lg mb-4">👁️ Preview</h3>
+						<div class="bg-white p-4 rounded-lg shadow-sm flex justify-center">
+							{#if selectedFile?.type.startsWith('image/')}
+								<img src={previewUrl} alt="Preview" class="max-w-full h-auto rounded-lg shadow-md" />
+							{:else}
+								<div class="text-center py-8">
+									<div class="text-6xl mb-2">📄</div>
+									<p class="text-gray-600">{selectedFile?.name}</p>
+								</div>
+							{/if}
+						</div>
+					</div>
+				{/if}
+			</div>
+		{:else}
+			<div in:fade>
+				<div class="mb-8">
+					<h3 class="text-xl font-bold text-gray-800 mb-4">View File from Blob ID</h3>
+					<div class="flex gap-3">
+						<input 
+							type="text" 
+							bind:value={viewBlobId}
+							placeholder="Paste Blob ID here..."
+							class="flex-1 px-4 py-3 border-2 border-gray-200 rounded-xl focus:border-indigo-500 focus:ring-0 outline-none transition-colors"
+						/>
+						<button 
+							class="bg-indigo-600 text-white px-8 py-3 rounded-xl font-semibold hover:bg-indigo-700 transition-colors shadow-md disabled:opacity-50"
+							onclick={viewFile}
+							disabled={viewLoading || !viewBlobId}
+						>
+							{viewLoading ? 'Loading...' : '👁️ View'}
+						</button>
+					</div>
+				</div>
+
+				{#if viewLoading}
+					<div class="text-center py-12">
+						<div class="w-12 h-12 border-4 border-gray-200 border-t-indigo-600 rounded-full animate-spin mx-auto mb-4"></div>
+						<p class="text-gray-600">Fetching from Walrus...</p>
+					</div>
+				{/if}
+
+				{#if viewError}
+					<div class="bg-red-50 border-2 border-red-500 text-red-700 p-4 rounded-xl mb-6">
+						❌ Error: {viewError}
+					</div>
+				{/if}
+
+				{#if viewContent}
+					<div class="bg-gray-50 rounded-xl p-6" transition:slide>
+						<h3 class="text-gray-800 font-bold text-lg mb-4">📄 Retrieved File</h3>
+						
+						<div class="grid grid-cols-3 gap-4 mb-6">
+							<div class="bg-white p-3 rounded-lg border-l-4 border-indigo-500 shadow-sm">
+								<div class="text-xs text-gray-500 uppercase mb-1">Type</div>
+								<div class="font-semibold">{viewContent.info.type}</div>
+							</div>
+							<div class="bg-white p-3 rounded-lg border-l-4 border-indigo-500 shadow-sm">
+								<div class="text-xs text-gray-500 uppercase mb-1">Format</div>
+								<div class="font-semibold">{viewContent.info.format}</div>
+							</div>
+							<div class="bg-white p-3 rounded-lg border-l-4 border-indigo-500 shadow-sm">
+								<div class="text-xs text-gray-500 uppercase mb-1">Size</div>
+								<div class="font-semibold">{viewContent.info.size}</div>
+							</div>
+						</div>
+
+						<div class="bg-white p-6 rounded-lg shadow-sm text-center">
+							{#if viewContent.type === 'image'}
+								<img src={viewContent.url} alt="Retrieved" class="max-w-full h-auto rounded-lg shadow-md mx-auto mb-6" />
+							{:else}
+								<div class="text-6xl mb-6">📄</div>
+							{/if}
+							
+							<a 
+								href={viewContent.url} 
+								download={viewContent.name}
+								class="inline-block bg-green-600 text-white px-8 py-3 rounded-xl font-semibold hover:bg-green-700 transition-colors shadow-md"
+							>
+								⬇️ Download File
+							</a>
+						</div>
+					</div>
+				{/if}
+			</div>
+		{/if}
+	</div>
+</div>
